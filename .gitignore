@@ -1,1 +1,12 @@
-/README.md
+# Python bytecode
+__pycache__/
+*.py[cod]
+
+# Runtime-generated maps, camera downloads, and state data
+output/
+input/uploaded_blueprint.*
+
+# Local environment files
+.venv/
+venv/
+.env

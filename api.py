@@ -1,0 +1,248 @@
+"""Website API for blueprint zoning and room-camera monitoring.
+
+Start with: uvicorn api:app --reload
+Open http://127.0.0.1:8000/docs to test the API interactively.
+"""
+from __future__ import annotations
+
+import json
+import threading
+import html
+import time
+import subprocess
+import sys
+from pathlib import Path
+from fastapi import FastAPI, File, HTTPException, UploadFile, Request
+from fastapi.responses import FileResponse, HTMLResponse, RedirectResponse
+from pydantic import BaseModel, HttpUrl
+
+from detect_zones import process_blueprint
+from map_generator import draw_factory_map
+from rooms import ROOMS
+from zone_manager import clear_alerts, save_rooms, set_camera, update_zone
+
+OUTPUT = Path("output")
+STATE_FILE = OUTPUT / "system_state.json"
+running_rooms: set[str] = set()
+run_lock = threading.Lock()
+camera_process: subprocess.Popen | None = None
+
+app = FastAPI(title="Factory Zone Detector API", version="1.0.0")
+
+# Room data belongs to an uploaded blueprint.  Do not expose stale rooms when
+# this API has no uploaded-blueprint state.
+if not STATE_FILE.exists():
+    ROOMS.clear()
+
+
+class CameraInput(BaseModel):
+    room_name: str
+    source: str  # Supports file paths, RTSP/HTTP links, and YouTube links.
+
+
+class MonitorInput(BaseModel):
+    confirm_frames: int = 10
+
+
+def blueprint_path() -> str:
+    if STATE_FILE.exists():
+        return json.loads(STATE_FILE.read_text(encoding="utf-8"))["blueprint"]
+    raise HTTPException(400, "Upload a blueprint first.")
+
+
+def redraw() -> dict:
+    report = draw_factory_map(blueprint_path())
+    report["map_updated_at"] = (OUTPUT / "colored_output.png").stat().st_mtime
+    return report
+
+
+@app.get("/health")
+def health():
+    return {"ok": True, "monitor_running": bool(camera_process and camera_process.poll() is None), "running_rooms": sorted(running_rooms)}
+
+
+@app.get("/", response_class=HTMLResponse)
+def control_page():
+    fields = "".join(
+        f'<label>{html.escape(name)}<input name="camera_{name}" value="{html.escape(room.get("camera") or "")}" placeholder="video file, YouTube, RTSP, or HTTP link"></label>'
+        for name, room in ROOMS.items()
+    ) or "<p>Upload a labelled blueprint first.</p>"
+    map_html = (f'<h2>Current coloured map</h2><img id="map" src="/map?t={time.time()}" '
+                'style="width:100%;border:1px solid #999"><p id="map-note">Map refreshes every 3 seconds while cameras run.</p>') \
+               if STATE_FILE.exists() and (OUTPUT / "colored_output.png").exists() else ""
+    return f'''<!doctype html><title>Factory Fire Monitor</title><style>body{{font-family:Arial;max-width:760px;margin:30px auto}}label,input,button{{display:block;width:100%;box-sizing:border-box;margin:9px 0}}label{{font-weight:bold}}input{{padding:9px}}button{{padding:10px;background:#b91c1c;color:white;border:0;border-radius:4px;font-weight:bold}}</style>
+    <h1>Factory Fire Monitor</h1><p>1. Upload blueprint. 2. Paste one link for each room. 3. Start all cameras.</p>
+    <form action="/page/blueprint" method="post" enctype="multipart/form-data"><input type="file" name="file" accept=".png,.jpg,.jpeg" required><button>1. Upload Blueprint</button></form>
+    {map_html}<h2>Camera links</h2><form action="/page/cameras" method="post">{fields}<button>2. Save Cameras and Start Detection</button></form>
+    <form action="/page/clear-alerts" method="post"><button type="submit">Clear Alerts (restore blueprint zones)</button></form><form action="/page/reset" method="post"><button type="submit">Clear Blueprint and Room Data</button></form><p><a href="/map?t=1">Open current colored map</a> · <a href="/zones">Zone data (JSON)</a></p>
+    <script>setInterval(() => {{ const map = document.getElementById('map'); if (map) map.src = '/map?t=' + Date.now(); }}, 3000);</script>'''
+
+
+@app.post("/page/blueprint")
+async def page_blueprint(file: UploadFile = File(...)):
+    await upload_blueprint(file)
+    return RedirectResponse("/", status_code=303)
+
+
+@app.post("/page/reset")
+def page_reset():
+    """Explicitly clear the current blueprint session and all room data."""
+    ROOMS.clear()
+    save_rooms()
+    for path in (STATE_FILE, OUTPUT / "rooms_state.json", OUTPUT / "zones.json", OUTPUT / "colored_output.png"):
+        if path.exists():
+            path.unlink()
+    print("BLUEPRINT CLEARED: room data is now empty", flush=True)
+    return RedirectResponse("/", status_code=303)
+
+
+@app.post("/page/clear-alerts")
+def page_clear_alerts():
+    clear_alerts(); save_rooms(); redraw()
+    print("ALERTS CLEARED: restored all rooms to blueprint zones", flush=True)
+    return RedirectResponse("/", status_code=303)
+
+
+@app.post("/alerts/clear")
+def clear_all_alerts():
+    """API version of the Clear Alerts control-page button."""
+    clear_alerts(); save_rooms()
+    return redraw()
+
+
+@app.post("/page/cameras")
+async def page_cameras(request: Request):
+    form = await request.form()
+    saved = []
+    for name in ROOMS:
+        source = str(form.get(f"camera_{name}", "")).strip()
+        set_camera(name, source or None)
+        if source:
+            saved.append(name)
+    save_rooms(); redraw()
+    print(f"CAMERAS UPDATED: {len(saved)} saved -> {', '.join(saved) if saved else 'none'}", flush=True)
+    start_monitoring(MonitorInput())
+    return RedirectResponse("/", status_code=303)
+
+
+@app.post("/blueprint")
+async def upload_blueprint(file: UploadFile = File(...)):
+    """Upload a labelled .png/.jpg blueprint and initialise all detected rooms."""
+    suffix = Path(file.filename or "blueprint.png").suffix.lower()
+    if suffix not in {".png", ".jpg", ".jpeg"}:
+        raise HTTPException(400, "Blueprint must be a PNG or JPEG image.")
+    target = Path("input") / f"uploaded_blueprint{suffix}"
+    target.parent.mkdir(exist_ok=True)
+    target.write_bytes(await file.read())
+    try:
+        detected = process_blueprint(str(target))
+    except RuntimeError as error:
+        raise HTTPException(500, str(error)) from error
+    ROOMS.clear(); ROOMS.update(detected); save_rooms()
+    OUTPUT.mkdir(exist_ok=True)
+    STATE_FILE.write_text(json.dumps({"blueprint": str(target)}), encoding="utf-8")
+    return redraw()
+
+
+@app.get("/zones")
+def zones():
+    """Current zone, alert, rectangle and camera information for every room."""
+    if not STATE_FILE.exists():
+        return {"rooms": {}, "statistics": {"high_alert": 0, "red": 0, "orange": 0, "yellow": 0, "green": 0,
+                                               "alert_rooms": 0, "monitored_rooms": 0, "unmonitored_rooms": 0},
+                "blueprint": None}
+    try:
+        return redraw()
+    except FileNotFoundError as error:
+        raise HTTPException(404, str(error)) from error
+
+
+class AlertTestInput(BaseModel):
+    room_name: str
+    event: str = "FIRE"
+
+
+@app.post("/alerts/test")
+def test_alert(alert: AlertTestInput):
+    """Test the website/map update path without needing a real fire video."""
+    room = alert.room_name.upper()
+    if room not in ROOMS:
+        raise HTTPException(404, f"Unknown room {room!r}")
+    # A test alert works even before a camera link is added, so the blueprint
+    # and web integration can be verified independently from camera hardware.
+    temporary_camera = not ROOMS[room].get("camera")
+    if temporary_camera:
+        ROOMS[room]["camera"] = "TEST ALERT (no physical camera)"
+    event = alert.event.upper()
+    if event not in {"FIRE", "SMOKE"}:
+        raise HTTPException(400, "event must be FIRE or SMOKE")
+    update_zone(room, fire=event == "FIRE", smoke=event == "SMOKE")
+    if temporary_camera:
+        ROOMS[room]["camera"] = None
+    save_rooms()
+    return redraw()
+
+
+@app.post("/cameras")
+def add_camera(camera: CameraInput):
+    """Set or replace the camera source for a room discovered from the blueprint."""
+    room = camera.room_name.upper()
+    try:
+        set_camera(room, camera.source)
+    except KeyError as error:
+        raise HTTPException(404, str(error)) from error
+    save_rooms()
+    redraw()
+    print(f"CAMERA UPDATED: {room} -> {camera.source}", flush=True)
+    return {"room_name": room, "source": camera.source, "message": "Camera saved"}
+
+
+@app.delete("/cameras/{room_name}")
+def remove_camera(room_name: str):
+    room = room_name.upper()
+    try:
+        set_camera(room, None)
+    except KeyError as error:
+        raise HTTPException(404, str(error)) from error
+    save_rooms(); redraw()
+    return {"room_name": room, "message": "Camera removed"}
+
+
+@app.post("/monitor/start")
+def start_monitoring(request: MonitorInput):
+    """Open and monitor every saved camera at the same time."""
+    global camera_process
+    cameras = [name for name, room in ROOMS.items() if room.get("camera")]
+    if not cameras:
+        raise HTTPException(400, "Add at least one camera link first.")
+    with run_lock:
+        if camera_process and camera_process.poll() is None:
+            return {"started": [], "already_running": sorted(running_rooms)}
+        running_rooms.update(cameras)
+        # A separate process is necessary for reliable OpenCV windows on Windows.
+        camera_process = subprocess.Popen(
+            [sys.executable, "camera_runner.py", "--confirm-frames", str(request.confirm_frames)],
+            cwd=Path(__file__).parent,
+        )
+    return {
+        "started": cameras,
+        "message": "One OpenCV window opens for every saved camera. Press q in any window to stop all cameras.",
+    }
+
+
+@app.get("/monitor/status")
+def monitor_status():
+    """Poll this endpoint from the website while monitoring is active."""
+    active = bool(camera_process and camera_process.poll() is None)
+    if not active:
+        running_rooms.clear()
+    return {"monitor_running": active, "running_rooms": sorted(running_rooms), "rooms": ROOMS}
+
+
+@app.get("/map")
+def current_map():
+    map_file = OUTPUT / "colored_output.png"
+    if not STATE_FILE.exists() or not map_file.exists():
+        raise HTTPException(404, "No map yet. Upload a blueprint first.")
+    # no-store avoids browsers showing an old map after an alert redraw.
+    return FileResponse(map_file, media_type="image/png", headers={"Cache-Control": "no-store, max-age=0", "Pragma": "no-cache"})

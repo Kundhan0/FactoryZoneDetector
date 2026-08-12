@@ -2,3 +2,7 @@ opencv-python
 numpy
 pytesseract
 Pillow
+yt-dlp
+fastapi
+uvicorn[standard]
+python-multipart

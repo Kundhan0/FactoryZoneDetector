@@ -54,3 +54,15 @@ ZONE_KEYWORDS = {
         "open workspace","office","consulting room","conference room"
     ]
 }
+
+# Only these factory-room terms can create a room record. Add terms here for
+# room names used in future blueprints.
+ROOM_KEYWORDS = {
+    "red": ["chemical storage", "chemical processing", "chemical", "furnace room", "furnace complex", "furnace", "laboratory", "lab", "raw material", "material storage", "storage room", "warehouse", "stores", "packaging"],
+    "orange": ["electrical room", "hvlv electrical", "electrical", "substation", "power room", "server room", "server", "data center", "central data", "control room", "process control", "backup generator", "generator"],
+    "yellow": ["kitchen", "canteen", "cafeteria", "break room", "pantry", "laundry", "maintenance room", "utility room"],
+    "green": ["office", "emergency exit", "first aid station", "first aid", "locker room", "locker", "outdoor garden", "garden", "reception", "conference room", "meeting room", "restroom", "bathroom"],
+}
+
+# Blueprint dashboards/titles/OCR counters never represent physical rooms.
+NON_ROOM_KEYWORDS = ["system warning", "safety violation", "plant metric", "total", "zone", "nominal", "current load", "power usage", "primary feed", "quality", "tested", "client", "date", "page"]
