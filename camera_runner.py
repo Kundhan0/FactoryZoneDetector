@@ -22,7 +22,7 @@ if not state.exists():
 
 blueprint = json.loads(state.read_text(encoding="utf-8"))["blueprint"]
 camera_names = [name for name, room in ROOMS.items() if room.get("camera")]
-print(f"OPENCV RUNNER STARTED: opening {len(camera_names)} camera window(s): {', '.join(camera_names)}", flush=True)
-print("Press q in any OpenCV window to stop all cameras.", flush=True)
+print(f"CAMERA RUNNER STARTED: processing {len(camera_names)} camera source(s): {', '.join(camera_names)}", flush=True)
+print("Render runs in headless mode; local desktop runs keep OpenCV windows.", flush=True)
 monitor_all(blueprint, args.confirm_frames)
 print("OPENCV RUNNER STOPPED", flush=True)
