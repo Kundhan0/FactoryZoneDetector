@@ -38,7 +38,9 @@ app = FastAPI(title="Factory Zone Detector API", version="1.0.0")
 # Enable CORS for website integration
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[origin.strip() for origin in os.getenv("CORS_ORIGINS", "*").split(",")],
+    # Browser Origin values never have a trailing slash. Normalize configured
+    # URLs so a copied Vercel URL ending in / still matches the preflight.
+    allow_origins=[origin.strip().rstrip("/") for origin in os.getenv("CORS_ORIGINS", "*").split(",") if origin.strip()] or ["*"],
     # The detector uses no browser cookies. Keeping this false also permits a
     # local development wildcard while production uses CORS_ORIGINS.
     allow_credentials=False,
