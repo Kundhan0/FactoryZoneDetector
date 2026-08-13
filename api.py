@@ -11,9 +11,15 @@ import html
 import time
 import subprocess
 import sys
+import re
+import os
+from urllib.parse import urlparse
+from urllib.request import Request as UrlRequest, urlopen
+from urllib.error import URLError
 from pathlib import Path
 from fastapi import FastAPI, File, HTTPException, UploadFile, Request
 from fastapi.responses import FileResponse, HTMLResponse, RedirectResponse
+from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, HttpUrl
 
 from detect_zones import process_blueprint
@@ -28,6 +34,17 @@ run_lock = threading.Lock()
 camera_process: subprocess.Popen | None = None
 
 app = FastAPI(title="Factory Zone Detector API", version="1.0.0")
+
+# Enable CORS for website integration
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=[origin.strip() for origin in os.getenv("CORS_ORIGINS", "*").split(",")],
+    # The detector uses no browser cookies. Keeping this false also permits a
+    # local development wildcard while production uses CORS_ORIGINS.
+    allow_credentials=False,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 # Room data belongs to an uploaded blueprint.  Do not expose stale rooms when
 # this API has no uploaded-blueprint state.
@@ -70,12 +87,27 @@ def control_page():
     map_html = (f'<h2>Current coloured map</h2><img id="map" src="/map?t={time.time()}" '
                 'style="width:100%;border:1px solid #999"><p id="map-note">Map refreshes every 3 seconds while cameras run.</p>') \
                if STATE_FILE.exists() and (OUTPUT / "colored_output.png").exists() else ""
-    return f'''<!doctype html><title>Factory Fire Monitor</title><style>body{{font-family:Arial;max-width:760px;margin:30px auto}}label,input,button{{display:block;width:100%;box-sizing:border-box;margin:9px 0}}label{{font-weight:bold}}input{{padding:9px}}button{{padding:10px;background:#b91c1c;color:white;border:0;border-radius:4px;font-weight:bold}}</style>
+    camera_cards = "".join(_camera_card(name, room.get("camera")) for name, room in ROOMS.items() if room.get("camera"))
+    preview_html = f"<h2>Live camera previews</h2><div class=\"cameras\">{camera_cards}</div>" if camera_cards else ""
+    return f'''<!doctype html><title>Factory Fire Monitor</title><style>body{{font-family:Arial;max-width:960px;margin:30px auto}}label,input,button{{display:block;width:100%;box-sizing:border-box;margin:9px 0}}label{{font-weight:bold}}input{{padding:9px}}button{{padding:10px;background:#b91c1c;color:white;border:0;border-radius:4px;font-weight:bold}}.cameras{{display:grid;grid-template-columns:repeat(auto-fit,minmax(300px,1fr));gap:14px}}.camera{{border:1px solid #999;padding:8px}}.camera h3{{margin:0 0 7px}}iframe,video{{width:100%;height:220px;border:0}}</style>
     <h1>Factory Fire Monitor</h1><p>1. Upload blueprint. 2. Paste one link for each room. 3. Start all cameras.</p>
     <form action="/page/blueprint" method="post" enctype="multipart/form-data"><input type="file" name="file" accept=".png,.jpg,.jpeg" required><button>1. Upload Blueprint</button></form>
-    {map_html}<h2>Camera links</h2><form action="/page/cameras" method="post">{fields}<button>2. Save Cameras and Start Detection</button></form>
+    {map_html}{preview_html}<h2>Camera links</h2><form action="/page/cameras" method="post">{fields}<button>2. Save Cameras and Start Detection</button></form>
     <form action="/page/clear-alerts" method="post"><button type="submit">Clear Alerts (restore blueprint zones)</button></form><form action="/page/reset" method="post"><button type="submit">Clear Blueprint and Room Data</button></form><p><a href="/map?t=1">Open current colored map</a> · <a href="/zones">Zone data (JSON)</a></p>
     <script>setInterval(() => {{ const map = document.getElementById('map'); if (map) map.src = '/map?t=' + Date.now(); }}, 3000);</script>'''
+
+
+def _camera_card(name: str, source: str) -> str:
+    """Return a browser-safe preview for sources browsers can play directly."""
+    escaped_name, escaped_source = html.escape(name), html.escape(source, quote=True)
+    video_id = re.search(r"(?:youtu\.be/|youtube\.com/(?:shorts/|watch\?v=))([A-Za-z0-9_-]{11})", source)
+    if video_id:
+        embed = f'<iframe src="https://www.youtube.com/embed/{video_id.group(1)}" title="{escaped_name}" allowfullscreen></iframe>'
+    elif source.lower().endswith((".mp4", ".webm", ".ogg")) or source.startswith(("http://", "https://")):
+        embed = f'<video controls muted autoplay src="{escaped_source}">Browser cannot play this video.</video>'
+    else:
+        embed = '<p>Preview unavailable for RTSP. Detection still runs in the desktop detector.</p>'
+    return f'<section class="camera"><h3>{escaped_name}</h3>{embed}</section>'
 
 
 @app.post("/page/blueprint")
@@ -246,3 +278,184 @@ def current_map():
         raise HTTPException(404, "No map yet. Upload a blueprint first.")
     # no-store avoids browsers showing an old map after an alert redraw.
     return FileResponse(map_file, media_type="image/png", headers={"Cache-Control": "no-store, max-age=0", "Pragma": "no-cache"})
+
+
+# ============================================================================
+# New API Endpoints for Website Integration
+# ============================================================================
+
+class CameraData(BaseModel):
+    camera_name: str
+    location: str = ""
+    cloud_url: str = ""
+
+
+class BlueprintUploadResponse(BaseModel):
+    success: bool
+    rooms: dict = {}
+    statistics: dict = {}
+    message: str = ""
+
+
+class BlueprintUrlInput(BaseModel):
+    url: str
+
+
+def process_blueprint_target(target: Path) -> dict:
+    """Populate shared room state and render a new map for a local blueprint."""
+    detected = process_blueprint(str(target))
+    ROOMS.clear()
+    ROOMS.update(detected)
+    save_rooms()
+    OUTPUT.mkdir(exist_ok=True)
+    STATE_FILE.write_text(json.dumps({"blueprint": str(target)}), encoding="utf-8")
+    result = redraw()
+    return {
+        "success": True,
+        "rooms": result.get("rooms", {}),
+        "statistics": result.get("statistics", {}),
+        "message": f"Blueprint processed successfully. Detected {len(detected)} rooms.",
+    }
+
+
+@app.post("/api/blueprint")
+async def api_upload_blueprint(file: UploadFile = File(...)):
+    """Upload blueprint for website integration and return detected rooms."""
+    try:
+        suffix = Path(file.filename or "blueprint.png").suffix.lower()
+        if suffix not in {".png", ".jpg", ".jpeg"}:
+            raise HTTPException(400, "Blueprint must be a PNG or JPEG image.")
+        
+        target = Path("input") / f"uploaded_blueprint{suffix}"
+        target.parent.mkdir(exist_ok=True)
+        target.write_bytes(await file.read())
+        
+        return process_blueprint_target(target)
+    except RuntimeError as error:
+        raise HTTPException(500, f"Blueprint processing failed: {str(error)}")
+    except Exception as error:
+        raise HTTPException(500, f"Unexpected error: {str(error)}")
+
+
+@app.post("/api/blueprint-url")
+def api_upload_blueprint_url(payload: BlueprintUrlInput):
+    """Download a public image URL, process it, and return rooms plus map data."""
+    parsed = urlparse(payload.url.strip())
+    if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+        raise HTTPException(400, "Blueprint URL must be a public http:// or https:// image URL.")
+    try:
+        request = UrlRequest(payload.url, headers={"User-Agent": "Agni-Hazemap/1.0"})
+        with urlopen(request, timeout=20) as response:
+            content_type = response.headers.get_content_type()
+            if content_type not in {"image/png", "image/jpeg"}:
+                raise HTTPException(400, "Blueprint URL must return a PNG or JPEG image, not a web page.")
+            image = response.read(15 * 1024 * 1024 + 1)
+        if len(image) > 15 * 1024 * 1024:
+            raise HTTPException(400, "Blueprint image must be 15 MB or smaller.")
+        suffix = ".png" if content_type == "image/png" else ".jpg"
+        target = Path("input") / f"url_blueprint{suffix}"
+        target.parent.mkdir(exist_ok=True)
+        target.write_bytes(image)
+        return process_blueprint_target(target)
+    except HTTPException:
+        raise
+    except (URLError, TimeoutError) as error:
+        raise HTTPException(400, f"Could not download blueprint URL: {error}") from error
+    except RuntimeError as error:
+        raise HTTPException(500, f"Blueprint processing failed: {error}") from error
+    except Exception as error:
+        raise HTTPException(500, f"Unexpected error: {error}") from error
+
+
+@app.get("/api/rooms")
+def api_get_rooms():
+    """Get formatted rooms data for website display."""
+    if not ROOMS:
+        return {
+            "success": False,
+            "rooms": {},
+            "statistics": {
+                "total": 0,
+                "red": 0,
+                "orange": 0,
+                "yellow": 0,
+                "green": 0,
+                "high_alert": 0
+            },
+            "message": "No blueprint uploaded yet."
+        }
+    
+    stats = {
+        "total": len(ROOMS),
+        "red": sum(1 for r in ROOMS.values() if r.get("zone") == "red"),
+        "orange": sum(1 for r in ROOMS.values() if r.get("zone") == "orange"),
+        "yellow": sum(1 for r in ROOMS.values() if r.get("zone") == "yellow"),
+        "green": sum(1 for r in ROOMS.values() if r.get("zone") == "green"),
+        "high_alert": sum(1 for r in ROOMS.values() if r.get("zone") == "high_alert"),
+    }
+    
+    return {
+        "success": True,
+        "rooms": dict(ROOMS),
+        "statistics": stats,
+        "message": "Rooms data retrieved successfully."
+    }
+
+
+@app.post("/api/cameras")
+def api_add_cameras(cameras: list[CameraData]):
+    """Add multiple cameras for detected rooms."""
+    try:
+        added_count = 0
+        for camera in cameras:
+            # The website records a human-friendly camera name separately from
+            # its room assignment.  Keep camera_name as a backwards-compatible
+            # fallback for existing API callers.
+            room = (camera.location or camera.camera_name).strip().upper()
+            if room not in ROOMS:
+                continue
+            set_camera(room, camera.cloud_url)
+            added_count += 1
+        
+        save_rooms()
+        redraw()
+        return {
+            "success": True,
+            "added": added_count,
+            "message": f"Added {added_count} camera(s) successfully."
+        }
+    except Exception as error:
+        raise HTTPException(500, f"Failed to add cameras: {str(error)}")
+
+
+@app.get("/api/map-image")
+def api_get_map_image():
+    """Get current map image URL for website."""
+    map_file = OUTPUT / "colored_output.png"
+    if not STATE_FILE.exists() or not map_file.exists():
+        return {
+            "success": False,
+            "map_url": None,
+            "message": "No map available. Upload a blueprint first."
+        }
+    
+    # Return the map file path and URL for frontend to fetch
+    return {
+        "success": True,
+        "map_url": f"/map?t={time.time()}",
+        "exists": True,
+        "message": "Map image available."
+    }
+
+
+@app.get("/api/health")
+def api_health():
+    """Check API health and detector status."""
+    return {
+        "ok": True,
+        "detector_running": True,
+        "blueprint_loaded": STATE_FILE.exists() and bool(ROOMS),
+        "rooms_count": len(ROOMS),
+        "monitor_running": bool(camera_process and camera_process.poll() is None),
+        "version": "1.0.0"
+    }
